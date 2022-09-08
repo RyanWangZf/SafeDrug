@@ -409,6 +409,10 @@ def create_patient_feature(data, subject_id_list):
     df = df.loc[subject_id_list]
     df = df[['SUBJECT_ID','AGE','GENDER','ETHNICITY']]
     df = pd.concat([df, patient_mortality], axis=1).reset_index(drop=True)
+
+    # MIMIC-III hide age>90 making it >300 yrs old
+    df['AGE'] = df['AGE'].apply(lambda x: x if x < 90 else x-300+90)
+    
     df.to_csv(feature_file)
 
 
