@@ -5,6 +5,9 @@ import numpy as np
 from collections import defaultdict
 from rdkit import Chem
 from rdkit.Chem import BRICS
+from tqdm import tqdm
+
+import pdb
 
 ##### process medications #####
 # load med data
@@ -137,7 +140,7 @@ def filter_1000_most_pro(pro_pd):
     return pro_pd.reset_index(drop=True) 
 
 ###### combine three tables #####
-def combine_process(med_pd, diag_pd, pro_pd):
+def combine_process(med_pd, diag_pd, pro_pd, adm_df):
 
     med_pd_key = med_pd[['SUBJECT_ID', 'HADM_ID']].drop_duplicates()
     diag_pd_key = diag_pd[['SUBJECT_ID', 'HADM_ID']].drop_duplicates()
@@ -160,7 +163,8 @@ def combine_process(med_pd, diag_pd, pro_pd):
     data = data.merge(pro_pd, on=['SUBJECT_ID', 'HADM_ID'], how='inner')
     #     data['ICD9_CODE_Len'] = data['ICD9_CODE'].map(lambda x: len(x))
     data['ATC3_num'] = data['ATC3'].map(lambda x: len(x))
-
+    
+    data = data.merge(adm_df, on=['HADM_ID','SUBJECT_ID'], how='inner')
     return data
 
 def statistics(data):
@@ -220,6 +224,9 @@ class Voc(object):
     def __init__(self):
         self.idx2word = {}
         self.word2idx = {}
+    
+    def __len__(self):
+        return len(self.idx2word.keys())
 
     def add_sentence(self, sentence):
         for word in sentence:
@@ -244,18 +251,37 @@ def create_str_token_mapping(df):
 # create final records
 def create_patient_record(df, diag_voc, med_voc, pro_voc):
     records = [] # (patient, code_kind:3, codes)  code_kind:diag, proc, med
-    for subject_id in df['SUBJECT_ID'].unique():
+    mortality = [] # (patient, visits)
+    length_of_stay = [] # (patient, visits)
+
+    subject_id_list = []
+
+    for subject_id in tqdm(df['SUBJECT_ID'].unique(), 'creating EHR sequence'):
+        subject_id_list.append(subject_id)
+
         item_df = df[df['SUBJECT_ID'] == subject_id]
         patient = []
+        mortality_ = []
+        length_of_stay_ = []
         for index, row in item_df.iterrows():
             admission = []
             admission.append([diag_voc.word2idx[i] for i in row['ICD9_CODE']])
             admission.append([pro_voc.word2idx[i] for i in row['PRO_CODE']])
             admission.append([med_voc.word2idx[i] for i in row['ATC3']])
             patient.append(admission)
-        records.append(patient) 
+
+            mortality_.append(row['MORTALITY'])
+            length_of_stay_.append(row['LOS'])
+        
+        records.append(patient)
+        mortality.append(mortality_)
+        length_of_stay.append(length_of_stay_)
     dill.dump(obj=records, file=open(ehr_sequence_file, 'wb'))
-    return records
+
+    dill.dump(obj=mortality, file=open(mortality_file, 'wb'))
+    dill.dump(obj=length_of_stay, file=open(los_sequence_file,'wb'))
+    return records, subject_id_list
+
         
 # get ddi matrix
 def get_ddi_matrix(records, med_voc, ddi_file):
@@ -348,6 +374,43 @@ def get_ddi_mask(atc42SMLES, med_voc):
             ddi_matrix[i, fracSet.index(frac)] = 1
     return ddi_matrix
 
+def patient_process(patient_file):
+    patient_df = pd.read_csv(patient_file)
+    pats = patient_df[['SUBJECT_ID', 'GENDER', 'DOB', 'DOD']]
+    pats.DOB = pd.to_datetime(pats.DOB)
+    pats.DOD = pd.to_datetime(pats.DOD)
+    return pats
+
+def adm_process(adm_file, patient_df):
+    adm_df = pd.read_csv(adm_file)
+    admits = adm_df[['SUBJECT_ID', 'HADM_ID', 'ADMITTIME', 'DISCHTIME', 'DEATHTIME', 'ETHNICITY', 'DIAGNOSIS']]
+    admits.ADMITTIME = pd.to_datetime(admits.ADMITTIME)
+    admits.DISCHTIME = pd.to_datetime(admits.DISCHTIME)
+    admits.DEATHTIME = pd.to_datetime(admits.DEATHTIME)
+    admits = patient_df.merge(admits, on=['SUBJECT_ID'], how='inner')
+    mortality = admits.DOD.notnull() & ((admits.ADMITTIME <= admits.DOD) & (admits.DISCHTIME >= admits.DOD)) # in visit mortality
+    admits['MORTALITY'] = mortality
+
+    admits['ADMITTIME'] = admits['ADMITTIME'].dt.date
+    admits['DOB'] = admits['DOB'].dt.date
+    admits['AGE'] = admits.apply(lambda e: (e['ADMITTIME'] - e['DOB']).days/365, axis=1)
+    admits.loc[admits['AGE'] < 0, 'AGE'] = 90
+
+    los =  (admits['DISCHTIME'].dt.date - admits['ADMITTIME']).dt.days # length of stay (days)
+    admits['LOS'] = los
+
+    admits = admits[['SUBJECT_ID','GENDER','HADM_ID','ETHNICITY','AGE','LOS','MORTALITY']]
+    return admits
+
+def create_patient_feature(data, subject_id_list):
+    df = data.drop_duplicates('SUBJECT_ID')
+    patient_mortality = data[['MORTALITY','SUBJECT_ID']].groupby('SUBJECT_ID').max()
+    df.index = df['SUBJECT_ID']
+    df = df.loc[subject_id_list]
+    df = df[['SUBJECT_ID','AGE','GENDER','ETHNICITY']]
+    df = pd.concat([df, patient_mortality], axis=1).reset_index(drop=True)
+    df.to_csv(feature_file)
+
 
 if __name__ == '__main__':
 
@@ -356,6 +419,9 @@ if __name__ == '__main__':
     med_file = '/srv/local/data/physionet.org/files/mimiciii/1.4/PRESCRIPTIONS.csv'
     diag_file = '/srv/local/data/physionet.org/files/mimiciii/1.4/DIAGNOSES_ICD.csv'
     procedure_file = '/srv/local/data/physionet.org/files/mimiciii/1.4/PROCEDURES_ICD.csv'
+
+    patient_table_file = '/srv/local/data/physionet.org/files/mimiciii/1.4/PATIENTS.csv'
+    adm_table_file = '/srv/local/data/physionet.org/files/mimiciii/1.4/ADMISSIONS.csv'
 
     # input auxiliary files
     med_structure_file = './output/atc32SMILES.pkl'
@@ -372,7 +438,15 @@ if __name__ == '__main__':
     vocabulary_file = "./output/voc_final.pkl"
     ddi_mask_H_file = "./output/ddi_mask_H.pkl"
     atc3toSMILES_file = './output/atc3toSMILES.pkl'
+
+    los_sequence_file = './output/visit_los.pkl'
+    mortality_file = './output/visit_mortality.pkl'
+    feature_file = './output/feature.csv' # patient features: age, gender, ethinicity
     
+    # for patient features
+    patient_df = patient_process(patient_table_file) # get gender and DOB of patient
+    adm_df = adm_process(adm_table_file, patient_df) # get admission mortality, get age of patient
+
     # for med
     med_pd = med_process(med_file)
     med_pd_lg2 = process_visit_lg2(med_pd).reset_index(drop=True)    
@@ -401,7 +475,7 @@ if __name__ == '__main__':
     print ('complete procedure processing')
 
     # combine
-    data = combine_process(med_pd, diag_pd, pro_pd)
+    data = combine_process(med_pd, diag_pd, pro_pd, adm_df)
     statistics(data)
     print ('complete combining')
 
@@ -410,8 +484,11 @@ if __name__ == '__main__':
     print ("obtain voc")
 
     # create ehr sequence data
-    records = create_patient_record(data, diag_voc, med_voc, pro_voc)
+    records, subject_id_list = create_patient_record(data, diag_voc, med_voc, pro_voc)
     print ("obtain ehr sequence data")
+
+    feature = create_patient_feature(data, subject_id_list)
+    print ("obtain patient static tabular feature data")
 
     # create ddi adj matrix
     ddi_adj = get_ddi_matrix(records, med_voc, ddi_file)
